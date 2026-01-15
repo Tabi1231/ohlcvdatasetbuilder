@@ -1,0 +1,6 @@
+
+{
+  "name": "Historical Crypto Data Platform",
+  "description": "A world-class engineering tool for collecting gapless historical OHLCV datasets. Features a resilient rate-limiting engine, exponential backoff, and standardized CSV exports for machine learning and time-series research.",
+  "requestFramePermissions": []
+}
