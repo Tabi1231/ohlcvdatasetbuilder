@@ -12,7 +12,7 @@
     <style>
         body { font-family: 'Inter', sans-serif; background-color: #020617; }
         #root:empty::before {
-            content: "Loading Engine...";
+            content: "Initializing Data Engine...";
             display: flex;
             justify-content: center;
             align-items: center;
@@ -20,6 +20,7 @@
             color: #64748b;
             font-family: sans-serif;
             font-size: 14px;
+            letter-spacing: 0.05em;
         }
     </style>
 
@@ -40,12 +41,14 @@
 
     <!-- 
       We use data-type="module" so Babel handles the imports correctly.
-      Added data-presets to explicitly tell Babel to handle React and TypeScript.
+      data-presets: handles JSX and TypeScript.
+      data-plugins: ensures that local 'import' statements are transformed into a format the browser handles reliably.
     -->
     <script 
       type="text/babel" 
       data-type="module" 
       data-presets="react,typescript"
+      data-plugins="transform-modules-umd"
       src="index.tsx">
     </script>
 </body>
