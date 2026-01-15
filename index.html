@@ -5,51 +5,408 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Crypto Data Collector</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Babel Standalone -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Inter', sans-serif; background-color: #020617; }
+        body { font-family: 'Inter', sans-serif; background-color: #020617; color: white; margin: 0; overflow-x: hidden; }
         #root:empty::before {
-            content: "Initializing Data Engine...";
+            content: "LOADING DATA ENGINE...";
             display: flex;
             justify-content: center;
             align-items: center;
             height: 100vh;
-            color: #64748b;
-            font-family: sans-serif;
+            color: #3b82f6;
+            font-family: monospace;
             font-size: 14px;
-            letter-spacing: 0.05em;
+            letter-spacing: 0.3em;
+            animation: pulse 1.5s infinite;
         }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #020617; }
+        ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #334155; }
     </style>
 
     <script type="importmap">
 {
   "imports": {
-    "react": "https://esm.sh/react@19.0.0",
-    "react-dom": "https://esm.sh/react-dom@19.0.0",
-    "react-dom/client": "https://esm.sh/react-dom@19.0.0/client",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "react": "https://esm.sh/react@19.0.0?dev",
+    "react-dom": "https://esm.sh/react-dom@19.0.0?dev",
+    "react-dom/client": "https://esm.sh/react-dom@19.0.0/client?dev",
     "react/": "https://esm.sh/react@^19.2.3/"
   }
 }
 </script>
 </head>
-<body class="bg-slate-950 text-slate-50 min-h-screen">
+<body class="bg-slate-950">
     <div id="root"></div>
 
-    <!-- 
-      We use data-type="module" so Babel handles the imports correctly.
-      data-presets: handles JSX and TypeScript.
-      data-plugins: ensures that local 'import' statements are transformed into a format the browser handles reliably.
-    -->
-    <script 
-      type="text/babel" 
-      data-type="module" 
-      data-presets="react,typescript"
-      data-plugins="transform-modules-umd"
-      src="index.tsx">
+    <script type="text/babel" data-type="module">
+        import React, { useState, useCallback, useRef, useEffect } from 'react';
+        import { createRoot } from 'react-dom/client';
+
+        /**
+         * GLOBAL CONFIGURATION & UTILITIES
+         */
+        const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'LINKUSDT', 'AVAXUSDT'];
+        const TIMEFRAMES = [
+            { label: '1 Minute', value: '1m', ms: 60000 },
+            { label: '5 Minutes', value: '5m', ms: 300000 },
+            { label: '1 Hour', value: '1h', ms: 3600000 },
+            { label: '1 Day', value: '1d', ms: 86400000 }
+        ];
+
+        const App = () => {
+            // -- State --
+            const [config, setConfig] = useState({
+                symbol: 'BTCUSDT',
+                timeframe: '1h',
+                startDate: '2024-01-01',
+                endDate: new Date().toISOString().split('T')[0],
+                maxRequestsPerMin: 600
+            });
+
+            const [rateLimit, setRateLimit] = useState({
+                used: 0,
+                safeInterval: 100
+            });
+
+            const [isCollecting, setIsCollecting] = useState(false);
+            const [isPaused, setIsPaused] = useState(false);
+            const [logs, setLogs] = useState([]);
+            const [dataset, setDataset] = useState([]);
+            const [progress, setProgress] = useState({ reqsDone: 0, totalReqs: 1, candles: 0 });
+
+            // -- Refs for loop control --
+            const isPausedRef = useRef(false);
+            const stopRef = useRef(false);
+            const rateLimitRef = useRef(600);
+
+            // -- Helpers --
+            const addLog = (message, level = 'info') => {
+                const id = Math.random().toString(36).substr(2, 9);
+                setLogs(prev => [{ id, message, level, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 100));
+            };
+
+            const calculateEstimation = () => {
+                const start = new Date(config.startDate).getTime();
+                const end = new Date(config.endDate).getTime();
+                const tf = TIMEFRAMES.find(t => t.value === config.timeframe);
+                const totalCandles = Math.floor((end - start) / tf.ms);
+                const totalRequests = Math.max(1, Math.ceil(totalCandles / 1000));
+                return { totalCandles, totalRequests };
+            };
+
+            const est = calculateEstimation();
+
+            // -- Core Fetch Logic --
+            const runCollection = async () => {
+                setIsCollecting(true);
+                setIsPaused(false);
+                stopRef.current = false;
+                setDataset([]);
+                setRateLimit(prev => ({ ...prev, used: 0 }));
+                
+                const startTs = new Date(config.startDate).getTime();
+                const endTs = new Date(config.endDate).getTime();
+                const tfMs = TIMEFRAMES.find(t => t.value === config.timeframe).ms;
+                
+                addLog(`Initializing extraction for ${config.symbol}...`, 'success');
+
+                let currentTs = startTs;
+                let buffer = [];
+                let reqCount = 0;
+
+                try {
+                    while (currentTs < endTs && !stopRef.current) {
+                        // Pause handling
+                        while (isPausedRef.current) {
+                            await new Promise(r => setTimeout(r, 500));
+                            if (stopRef.current) break;
+                        }
+                        if (stopRef.current) break;
+
+                        // Fetch
+                        const url = `https://api.binance.com/api/v3/klines?symbol=${config.symbol}&interval=${config.timeframe}&startTime=${currentTs}&limit=1000`;
+                        const res = await fetch(url);
+                        
+                        if (res.status === 429) {
+                            addLog("Rate limit hit (429). Sleeping for 10s...", "error");
+                            await new Promise(r => setTimeout(r, 10000));
+                            continue;
+                        }
+
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+                        const data = await res.json();
+                        if (!data.length) {
+                            addLog("No more data returned from exchange.", "warn");
+                            break;
+                        }
+
+                        const batch = data.map(d => ({
+                            t: d[0], o: d[1], h: d[2], l: d[3], c: d[4], v: d[5]
+                        })).filter(c => c.t <= endTs);
+
+                        buffer = [...buffer, ...batch];
+                        reqCount++;
+
+                        // UI Updates
+                        setRateLimit(prev => ({ ...prev, used: prev.used + 1 }));
+                        setProgress({ 
+                            reqsDone: reqCount, 
+                            totalReqs: est.totalRequests, 
+                            candles: buffer.length 
+                        });
+
+                        if (reqCount % 2 === 0) setDataset([...buffer]);
+
+                        // Next Start Time
+                        currentTs = data[data.length - 1][0] + tfMs;
+
+                        // Throttle
+                        const delay = Math.ceil(60000 / rateLimitRef.current);
+                        await new Promise(r => setTimeout(r, delay));
+
+                        if (data.length < 1000) break;
+                    }
+
+                    setDataset(buffer);
+                    addLog(`Success! Extracted ${buffer.length} records.`, 'success');
+                } catch (err) {
+                    addLog(`Fatal Error: ${err.message}`, 'error');
+                } finally {
+                    setIsCollecting(false);
+                }
+            };
+
+            const downloadCSV = () => {
+                const headers = "date,time,open,high,low,close,volume";
+                const rows = dataset.map(d => {
+                    const iso = new Date(d.t).toISOString();
+                    return `${iso.split('T')[0]},${iso.split('T')[1].slice(0,5)},${d.o},${d.h},${d.l},${d.c},${d.v}`;
+                });
+                const blob = new Blob([[headers, ...rows].join('\n')], { type: 'text/csv' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${config.symbol}_${config.timeframe}.csv`;
+                a.click();
+            };
+
+            return (
+                <div className="min-h-screen p-4 md:p-10 max-w-7xl mx-auto">
+                    {/* Header */}
+                    <header className="flex flex-col md:flex-row justify-between items-center mb-10 gap-4">
+                        <div className="text-center md:text-left">
+                            <h1 className="text-4xl font-black text-white tracking-tighter uppercase flex items-center gap-3">
+                                <span className="p-2 bg-blue-600 rounded-lg text-2xl">⚡</span>
+                                Data Collector
+                            </h1>
+                            <p className="text-slate-500 font-medium text-sm mt-1 uppercase tracking-widest">Historical OHLCV Engine v2.0</p>
+                        </div>
+                        <div className="flex gap-2">
+                           <div className="px-4 py-2 bg-slate-900 border border-slate-800 rounded-full text-xs font-bold text-slate-400">BINANCE REST API</div>
+                           <div className="px-4 py-2 bg-slate-900 border border-slate-800 rounded-full text-xs font-bold text-emerald-400">STABLE</div>
+                        </div>
+                    </header>
+
+                    <div className="grid lg:grid-cols-12 gap-8">
+                        {/* Sidebar */}
+                        <div className="lg:col-span-4 space-y-6">
+                            <section className="bg-slate-900/50 border border-slate-800 p-6 rounded-3xl backdrop-blur-sm shadow-2xl">
+                                <h3 className="text-xs font-bold text-slate-500 uppercase mb-6 tracking-widest border-b border-slate-800 pb-2">Configuration</h3>
+                                <div className="space-y-4">
+                                    <div className="space-y-1">
+                                        <label className="text-[10px] font-black text-slate-600 uppercase ml-1">Symbol Pair</label>
+                                        <select 
+                                            disabled={isCollecting}
+                                            value={config.symbol} 
+                                            onChange={e => setConfig({...config, symbol: e.target.value})}
+                                            className="w-full bg-slate-950 border border-slate-700 p-4 rounded-2xl text-sm focus:border-blue-500 transition-all outline-none"
+                                        >
+                                            {SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
+                                        </select>
+                                    </div>
+                                    <div className="space-y-1">
+                                        <label className="text-[10px] font-black text-slate-600 uppercase ml-1">Timeframe</label>
+                                        <select 
+                                            disabled={isCollecting}
+                                            value={config.timeframe} 
+                                            onChange={e => setConfig({...config, timeframe: e.target.value})}
+                                            className="w-full bg-slate-950 border border-slate-700 p-4 rounded-2xl text-sm focus:border-blue-500 transition-all outline-none"
+                                        >
+                                            {TIMEFRAMES.map(tf => <option key={tf.value} value={tf.value}>{tf.label}</option>)}
+                                        </select>
+                                    </div>
+                                    <div className="space-y-1">
+                                        <label className="text-[10px] font-black text-slate-600 uppercase ml-1">Start Date</label>
+                                        <input 
+                                            disabled={isCollecting}
+                                            type="date" 
+                                            value={config.startDate} 
+                                            onChange={e => setConfig({...config, startDate: e.target.value})}
+                                            className="w-full bg-slate-950 border border-slate-700 p-4 rounded-2xl text-sm focus:border-blue-500 transition-all outline-none" 
+                                        />
+                                    </div>
+
+                                    {!isCollecting ? (
+                                        <button onClick={runCollection} className="w-full bg-blue-600 hover:bg-blue-500 text-white font-black py-5 rounded-2xl transition-all shadow-xl shadow-blue-900/20 active:scale-95 uppercase text-sm tracking-widest">
+                                            Start Extraction
+                                        </button>
+                                    ) : (
+                                        <div className="grid grid-cols-2 gap-3">
+                                            <button 
+                                                onClick={() => { isPausedRef.current = !isPaused; setIsPaused(!isPaused); }} 
+                                                className="bg-slate-800 hover:bg-slate-700 py-4 rounded-2xl font-bold uppercase text-xs"
+                                            >
+                                                {isPaused ? 'Resume' : 'Pause'}
+                                            </button>
+                                            <button 
+                                                onClick={() => { stopRef.current = true; setIsCollecting(false); }} 
+                                                className="bg-red-600 hover:bg-red-500 py-4 rounded-2xl font-bold uppercase text-xs"
+                                            >
+                                                Stop
+                                            </button>
+                                        </div>
+                                    )}
+
+                                    {dataset.length > 0 && !isCollecting && (
+                                        <button onClick={downloadCSV} className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-black py-5 rounded-2xl transition-all shadow-xl shadow-emerald-900/20 active:scale-95 uppercase text-sm tracking-widest">
+                                            Download CSV ({dataset.length})
+                                        </button>
+                                    )}
+                                </div>
+                            </section>
+
+                            {/* Rate Limit UI */}
+                            <section className="bg-slate-900/50 border border-slate-800 p-6 rounded-3xl shadow-2xl">
+                                <div className="flex justify-between items-center mb-6">
+                                    <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Rate Control</h3>
+                                    <span className="text-[10px] px-2 py-1 bg-blue-900/30 text-blue-400 rounded-full font-bold">SMART THROTTLE</span>
+                                </div>
+                                <div className="grid grid-cols-2 gap-4 mb-6">
+                                    <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 text-center">
+                                        <p className="text-[10px] text-slate-600 mb-1 uppercase font-black">Used</p>
+                                        <p className="text-xl font-mono font-bold text-white">{rateLimit.used}</p>
+                                    </div>
+                                    <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 text-center">
+                                        <p className="text-[10px] text-slate-600 mb-1 uppercase font-black">Interval</p>
+                                        <p className="text-xl font-mono font-bold text-white">{Math.ceil(60000/config.maxRequestsPerMin)}ms</p>
+                                    </div>
+                                </div>
+                                <input 
+                                    type="range" min="60" max="1200" step="60" 
+                                    value={config.maxRequestsPerMin} 
+                                    onChange={(e) => {
+                                        const val = parseInt(e.target.value);
+                                        setConfig({...config, maxRequestsPerMin: val});
+                                        rateLimitRef.current = val;
+                                    }} 
+                                    className="w-full accent-blue-500 h-1 bg-slate-800 rounded-lg appearance-none mb-2" 
+                                />
+                                <div className="flex justify-between text-[10px] text-slate-600 font-black uppercase">
+                                    <span>Safe (60)</span>
+                                    <span>Fast (1200)</span>
+                                </div>
+                            </section>
+                        </div>
+
+                        {/* Main Body */}
+                        <div className="lg:col-span-8 space-y-6">
+                            {/* Dashboard Stats */}
+                            <section className="bg-slate-900 border border-slate-800 p-8 rounded-3xl shadow-2xl relative overflow-hidden">
+                                <div className="absolute top-0 right-0 p-8 opacity-10 select-none">
+                                    <span className="text-9xl font-black">{config.symbol.slice(0,3)}</span>
+                                </div>
+                                <div className="relative z-10">
+                                    <div className="flex justify-between items-end mb-8">
+                                        <div>
+                                            <h2 className="text-4xl font-black text-white">{config.symbol}</h2>
+                                            <p className="text-slate-500 font-bold uppercase text-xs tracking-widest">{config.timeframe} TIMEFRAME • SEQUENTIAL</p>
+                                        </div>
+                                        <div className="text-right">
+                                            <span className="text-5xl font-black text-blue-500 leading-none">
+                                                {progress.totalReqs > 0 ? Math.min(100, Math.round((progress.reqsDone/progress.totalReqs)*100)) : 0}%
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    <div className="h-4 bg-slate-950 rounded-full overflow-hidden mb-10 border border-slate-800 p-1">
+                                        <div 
+                                            className="h-full bg-gradient-to-r from-blue-600 to-indigo-500 rounded-full transition-all duration-700 ease-out" 
+                                            style={{ width: `${(progress.reqsDone/progress.totalReqs)*100}%` }}
+                                        />
+                                    </div>
+
+                                    <div className="grid grid-cols-2 md:grid-cols-3 gap-6">
+                                        <div className="bg-slate-950/50 p-6 rounded-3xl border border-slate-800">
+                                            <p className="text-[10px] text-slate-500 uppercase font-black mb-1">Batches Done</p>
+                                            <p className="text-2xl font-mono font-bold">{progress.reqsDone} / {progress.totalReqs}</p>
+                                        </div>
+                                        <div className="bg-slate-950/50 p-6 rounded-3xl border border-slate-800">
+                                            <p className="text-[10px] text-slate-500 uppercase font-black mb-1">Row Count</p>
+                                            <p className="text-2xl font-mono font-bold">{progress.candles.toLocaleString()}</p>
+                                        </div>
+                                        <div className="bg-slate-950/50 p-6 rounded-3xl border border-slate-800 col-span-2 md:col-span-1">
+                                            <p className="text-[10px] text-slate-500 uppercase font-black mb-1">Worker Status</p>
+                                            <p className={`text-2xl font-mono font-bold ${isCollecting ? (isPaused ? 'text-amber-500' : 'text-blue-500') : 'text-slate-700'}`}>
+                                                {isCollecting ? (isPaused ? 'PAUSED' : 'ACTIVE') : 'IDLE'}
+                                            </p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </section>
+
+                            {/* Console */}
+                            <section className="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden flex flex-col h-[400px] shadow-2xl">
+                                <div className="p-5 border-b border-slate-800 bg-slate-900/80 backdrop-blur-md flex justify-between items-center">
+                                    <div className="flex items-center gap-2">
+                                        <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
+                                        <span className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Live Logs</span>
+                                    </div>
+                                    <button onClick={() => setLogs([])} className="text-[10px] font-black text-slate-600 hover:text-slate-400 uppercase tracking-tighter transition-colors">Wipe Console</button>
+                                </div>
+                                <div className="p-6 overflow-y-auto space-y-3 font-mono text-[11px] flex-1 bg-black/30">
+                                    {!logs.length && (
+                                        <div className="text-slate-800 h-full flex flex-col items-center justify-center italic">
+                                            <span className="text-4xl mb-4">⌨️</span>
+                                            Ready for operation sequence...
+                                        </div>
+                                    )}
+                                    {logs.map(log => (
+                                        <div key={log.id} className="flex gap-4 border-l-2 border-slate-800 pl-4 group transition-all hover:border-blue-500">
+                                            <span className="text-slate-600 flex-shrink-0">{log.time}</span>
+                                            <span className={`
+                                                ${log.level === 'error' ? 'text-red-400' : ''} 
+                                                ${log.level === 'success' ? 'text-emerald-400 font-bold' : ''} 
+                                                ${log.level === 'warn' ? 'text-amber-400' : ''}
+                                                ${log.level === 'info' ? 'text-blue-300' : ''}
+                                            `}>
+                                                {log.message}
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </section>
+                        </div>
+                    </div>
+                    
+                    <footer className="mt-20 border-t border-slate-900 pt-10 pb-20 text-center">
+                        <p className="text-[10px] text-slate-700 font-black uppercase tracking-[0.5em]">High Precision Data Platform • For Research Only</p>
+                    </footer>
+                </div>
+            );
+        };
+
+        // Standard entry point
+        const container = document.getElementById('root');
+        if (container) {
+            const root = createRoot(container);
+            root.render(<App />);
+        }
     </script>
 </body>
 </html>
